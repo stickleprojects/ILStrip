@@ -1,5 +1,5 @@
 ﻿using System.IO;
-
+using System.Threading.Tasks;
 using Mono.Cecil;
 
 using NUnit.Framework;
@@ -19,6 +19,17 @@ namespace BrokenEvent.Shared.ILStripTests
       }
     }
 
+        [Test]
+        public async Task WalksAllTypes()
+        {
+            var filepath = @"D:\code\firefly\Northwind3\Northwind\bin\Debug\Northwind.exe";
+//var additionalBins = [];
+
+            var s = new ILStrip.ILStrip(filepath);
+
+            await s.ListAllClassesAndVars();
+
+        }
     [Test]
     public void NoChangeTest()
     {

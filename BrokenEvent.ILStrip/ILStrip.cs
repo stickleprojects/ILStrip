@@ -1,7 +1,11 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.IO;
-
+using System.Linq;
+using System.Threading.Tasks;
+using System.Threading.Tasks.Dataflow;
 using Mono.Cecil;
 using Mono.Cecil.Cil;
 using Mono.Collections.Generic;
@@ -14,7 +18,7 @@ namespace BrokenEvent.ILStrip
     private List<string> entryPoints = new List<string>();
     private List<TypeDefinition> entryPointTypes = new List<TypeDefinition>();
 
-    private List<TypeDefinition> usedTypes = new List<TypeDefinition>();
+    private ConcurrentBag<TypeDefinition> usedTypes = new ConcurrentBag<TypeDefinition>();
     private List<ModuleDefinition> references = new List<ModuleDefinition>();
     private List<ModuleReference> unmanagedReferences = new List<ModuleReference>();
     private List<TypeDefinition> unusedTypes = new List<TypeDefinition>();
@@ -45,7 +49,12 @@ namespace BrokenEvent.ILStrip
     /// <param name="filename">File to load assembly from</param>
     public ILStrip(string filename)
     {
-      definition = AssemblyDefinition.ReadAssembly(filename);
+            ReaderParameters parameters = new ReaderParameters()
+            {
+                AssemblyResolver =new KieronsAssemblyResolver(new DefaultAssemblyResolver()),
+               
+            };
+            definition = AssemblyDefinition.ReadAssembly(filename, parameters);
     }
 
     /// <summary>
@@ -142,123 +151,137 @@ namespace BrokenEvent.ILStrip
       foreach (TypeDefinition type in entryPointTypes)
         WalkClass(type);
 
-      for (int i = 0; i < usedTypes.Count; i++)
-        WalkClass(usedTypes[i]);
+            var arTypes = usedTypes.ToArray();
+            for (int i = 0; i < arTypes.Count(); i++)
+        WalkClass(arTypes[i]);
     }
-
-    private void WalkCustomAttributes(Collection<CustomAttribute> customAttributes)
-    {
-      int i = 0;
-      while (i < customAttributes.Count)
-      {
-        CustomAttribute attribute = customAttributes[i];
-        if (removeAttributesNamespaces.Contains(attribute.AttributeType.Namespace))
-          customAttributes.RemoveAt(i);
-        else
+        private async Task WalkCustomAttributesAsync(Collection<CustomAttribute> customAttributes)
         {
-          AddUsedType(attribute.AttributeType);
-          i++;
+            await Task.Run(() =>
+            {
+                int i = 0;
+                while (i < customAttributes.Count)
+                {
+                    CustomAttribute attribute = customAttributes[i];
+                    if (removeAttributesNamespaces.Contains(attribute.AttributeType.Namespace))
+                        customAttributes.RemoveAt(i);
+                    else
+                    {
+                        AddUsedType(attribute.AttributeType);
+                        i++;
+                    }
+                }
+            });
         }
-      }
+        private void WalkCustomAttributes(Collection<CustomAttribute> customAttributes)
+    {
+            WalkCustomAttributesAsync(customAttributes).Wait();
     }
+        private async  Task WalkClassAsync (TypeDefinition type)
+        {
+            TypeDefinition current = type;
+            while (true)
+            {
+                TypeReference baseRef = current.BaseType;
+                if (baseRef == null)
+                    break;
+                TypeDefinition baseDef = baseRef.Resolve();
+                if (baseDef == null)
+                    break;
 
+                AddUsedType(baseDef);
+                current = baseDef;
+            }
+
+            // no properties walk behavior: they're walked as get_%PropName/set_%PropName methods
+            foreach (MethodDefinition method in type.Methods)
+               await WalkMethodAsync(method);
+
+           await  WalkCustomAttributesAsync(type.CustomAttributes);
+
+            foreach (TypeReference iface in type.Interfaces)
+                AddUsedType(iface.Resolve());
+
+            foreach (FieldDefinition field in type.Fields)
+            {
+                await WalkCustomAttributesAsync(field.CustomAttributes);
+                AddUsedType(field.FieldType);
+            }
+        }
     private void WalkClass(TypeDefinition type)
     {
-      TypeDefinition current = type;
-      while (true)
-      {
-        TypeReference baseRef = current.BaseType;
-        if (baseRef == null)
-          break;
-        TypeDefinition baseDef = baseRef.Resolve();
-        if (baseDef == null)
-          break;
+            WalkClassAsync(type).Wait();
 
-        AddUsedType(baseDef);
-        current = baseDef;
-      }
-
-      // no properties walk behavior: they're walked as get_%PropName/set_%PropName methods
-      foreach (MethodDefinition method in type.Methods)
-        WalkMethod(method);
-
-      WalkCustomAttributes(type.CustomAttributes);
-
-      foreach (TypeReference iface in type.Interfaces)
-        AddUsedType(iface.Resolve());
-
-      foreach (FieldDefinition field in type.Fields)
-      {
-        WalkCustomAttributes(field.CustomAttributes);
-        AddUsedType(field.FieldType);
-      }
     }
+        private async Task WalkMethodAsync(MethodDefinition method)
+        {
+            await WalkCustomAttributesAsync(method.CustomAttributes);
 
-    private void WalkMethod(MethodDefinition method)
+            if ((method.Attributes & MethodAttributes.PInvokeImpl) != 0)
+            {
+                ModuleReference module = method.PInvokeInfo.Module;
+                if (!unmanagedReferences.Contains(module))
+                {
+                    Log("Native reference used: " + module.Name);
+                    unmanagedReferences.Add(module);
+                }
+            }
+
+            foreach (GenericParameter parameter in method.GenericParameters)
+                AddUsedType(parameter.DeclaringType);
+
+            foreach (ParameterDefinition parameter in method.Parameters)
+            {
+                AddUsedType(parameter.ParameterType);
+                await  WalkCustomAttributesAsync(parameter.CustomAttributes);
+            }
+
+            AddUsedType(method.ReturnType);
+
+            if (!method.HasBody)
+                return;
+
+            foreach (VariableDefinition variable in method.Body.Variables)
+                AddUsedType(variable.VariableType);
+
+            foreach (Instruction instruction in method.Body.Instructions)
+            {
+                MethodReference methodRef = instruction.Operand as MethodReference;
+                if (methodRef != null)
+                {
+                    AddUsedType(methodRef.DeclaringType);
+                    AddUsedType(methodRef.ReturnType);
+
+                    GenericInstanceMethod genericMethod = methodRef as GenericInstanceMethod;
+                    if (genericMethod != null)
+                        foreach (TypeReference parameter in genericMethod.GenericArguments)
+                            AddUsedType(parameter);
+
+                    foreach (ParameterDefinition parameter in methodRef.Parameters)
+                        AddUsedType(parameter.ParameterType);
+                    continue;
+                }
+
+                TypeReference typeRef = instruction.Operand as TypeReference;
+                if (typeRef != null)
+                {
+                    foreach (GenericParameter genericParameter in typeRef.GenericParameters)
+                        AddUsedType(genericParameter);
+                    AddUsedType(typeRef.DeclaringType);
+                    continue;
+                }
+
+                FieldReference fieldRef = instruction.Operand as FieldReference;
+                if (fieldRef != null)
+                {
+                    AddUsedType(fieldRef.FieldType);
+                    AddUsedType(fieldRef.DeclaringType);
+                }
+            }
+        }
+        private void WalkMethod(MethodDefinition method)
     {
-      WalkCustomAttributes(method.CustomAttributes);
-
-      if ((method.Attributes & MethodAttributes.PInvokeImpl) != 0)
-      {
-        ModuleReference module = method.PInvokeInfo.Module;
-        if (!unmanagedReferences.Contains(module))
-        {
-          Log("Native reference used: " + module.Name);
-          unmanagedReferences.Add(module);
-        }
-      }
-
-      foreach (GenericParameter parameter in method.GenericParameters)
-        AddUsedType(parameter.DeclaringType);
-
-      foreach (ParameterDefinition parameter in method.Parameters)
-      {
-        AddUsedType(parameter.ParameterType);
-        WalkCustomAttributes(parameter.CustomAttributes);
-      }
-
-      AddUsedType(method.ReturnType);
-
-      if (!method.HasBody)
-        return;
-
-      foreach (VariableDefinition variable in method.Body.Variables)
-        AddUsedType(variable.VariableType);
-
-      foreach (Instruction instruction in method.Body.Instructions)
-      {
-        MethodReference methodRef = instruction.Operand as MethodReference;
-        if (methodRef != null)
-        {
-          AddUsedType(methodRef.DeclaringType);
-          AddUsedType(methodRef.ReturnType);
-
-          GenericInstanceMethod genericMethod = methodRef as GenericInstanceMethod;
-          if (genericMethod != null)
-            foreach (TypeReference parameter in genericMethod.GenericArguments)
-              AddUsedType(parameter);
-
-          foreach (ParameterDefinition parameter in methodRef.Parameters)
-            AddUsedType(parameter.ParameterType);
-          continue;
-        }
-
-        TypeReference typeRef = instruction.Operand as TypeReference;
-        if (typeRef != null)
-        {
-          foreach (GenericParameter genericParameter in typeRef.GenericParameters)
-            AddUsedType(genericParameter);
-          AddUsedType(typeRef.DeclaringType);
-          continue;
-        }
-
-        FieldReference fieldRef = instruction.Operand as FieldReference;
-        if (fieldRef != null)
-        {
-          AddUsedType(fieldRef.FieldType);
-          AddUsedType(fieldRef.DeclaringType);
-        }        
-      }
+            WalkMethodAsync(method).Wait();
     }
 
     private void AddUsedType(TypeReference typeRef)
@@ -305,6 +328,42 @@ namespace BrokenEvent.ILStrip
     {
       get { return unusedTypes; }
     }
+
+        public async Task ListAllClassesAndVars()
+        {
+
+            Log("Parallelling types");
+            var block = new ActionBlock<TypeDefinition>(
+                async t => await WalkClassAsync(t),
+                new ExecutionDataflowBlockOptions
+                {
+                    BoundedCapacity = 100,
+                    MaxDegreeOfParallelism = Environment.ProcessorCount // 2 cores
+                });
+
+                
+            Log("Enumerating all types");
+            foreach(var t in definition.MainModule.Types)
+            {
+                //Debug.WriteLine(t.Name);
+                //WalkClass(t);
+               await block.SendAsync(t);
+
+
+            }
+            block.Complete();
+            await block.Completion;
+
+
+            using (var fout = File.CreateText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "usedtypes.txt")))
+            {
+                foreach (var ut in usedTypes)
+                {
+                    fout.WriteLine(ut.FullName);
+                }
+            }
+
+        }
 
     /// <summary>
     /// Scans all the types and build <see cref="UnusedTypes"/> list of all of them,
