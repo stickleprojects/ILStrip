@@ -188,9 +188,15 @@ namespace BrokenEvent.ILStrip
                 TypeDefinition baseDef = baseRef.Resolve();
                 if (baseDef == null)
                     break;
-
-                AddUsedType(baseDef);
-                current = baseDef;
+                if (baseDef.Name != nameof(System.Object))
+                {
+                    AddUsedType(baseDef);
+                    current = baseDef;
+                }
+                else
+                {
+                    break;
+                }
             }
 
             // no properties walk behavior: they're walked as get_%PropName/set_%PropName methods
@@ -301,18 +307,22 @@ namespace BrokenEvent.ILStrip
       foreach (GenericParameter parameter in typeDef.GenericParameters)
         AddUsedType(parameter);
 
-      if (typeDef.Module != definition.MainModule)
-      {
-        if (!references.Contains(typeDef.Module))
-        {
-          Log("Reference used: " + typeDef.Module.FullyQualifiedName);
-          references.Add(typeDef.Module);
-        }
-        return;
-      }
+            if (typeDef.Module != definition.MainModule)
+            {
+                if (!references.Contains(typeDef.Module))
+                {
+                    Log("Reference used: " + typeDef.Module.FullyQualifiedName);
+                    references.Add(typeDef.Module);
+                }
 
-      foreach (CustomAttribute attribute in typeDef.CustomAttributes)
-        AddUsedType(attribute.AttributeType);
+                //return;
+            }
+            else
+            {
+
+                foreach (CustomAttribute attribute in typeDef.CustomAttributes)
+                    AddUsedType(attribute.AttributeType);
+            }
 
       if (usedTypes.Contains(typeDef))
         return;
@@ -338,7 +348,7 @@ namespace BrokenEvent.ILStrip
                 new ExecutionDataflowBlockOptions
                 {
                     BoundedCapacity = 100,
-                    MaxDegreeOfParallelism = Environment.ProcessorCount // 2 cores
+                    MaxDegreeOfParallelism = 1 // Environment.ProcessorCount // 2 cores
                 });
 
                 
